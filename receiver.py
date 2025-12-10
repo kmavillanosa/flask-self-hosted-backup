@@ -2,7 +2,7 @@ from flask import Flask, request
 import os
 from datetime import datetime
 
-SAVE_DIR = r"C:\\your\\path\\to\\save\\files"  # <-- change this
+SAVE_DIR = r"C:\\your\\path\\to\\save\\files"
 
 app = Flask(__name__)
 os.makedirs(SAVE_DIR, exist_ok=True)
