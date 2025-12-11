@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import os
 from datetime import datetime
 from io import BytesIO
@@ -12,6 +12,7 @@ import time
 import uuid
 import logging
 import sys
+import plistlib
 
 try:
 	from flask_cors import CORS
@@ -21,16 +22,17 @@ except ImportError:
 
 SAVE_DIR = r"C:\Users\kmavillanosa\Pictures\IPHONE"  # <-- change this
 CHECKSUM_DB_PATH = os.path.join(SAVE_DIR, '.checksums.json')
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
+CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for ultra-fast streaming
+PROGRESS_UPDATE_INTERVAL = 1024 * 1024  # Update progress every 1MB instead of every chunk
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 LOG_FILE = os.path.join(LOG_DIR, 'receiver.log')
 
 # Create logs directory if it doesn't exist
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Configure logging
+# Configure logging - Only WARNING and above, except for successful uploads
 logging.basicConfig(
-	level=logging.INFO,
+	level=logging.WARNING,
 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	handlers=[
 		logging.FileHandler(LOG_FILE, encoding='utf-8'),
@@ -38,6 +40,16 @@ logging.basicConfig(
 	]
 )
 logger = logging.getLogger(__name__)
+
+# Create a separate logger for successful uploads that always logs
+upload_logger = logging.getLogger('uploads')
+upload_logger.setLevel(logging.INFO)
+# Add handler if not already added
+if not upload_logger.handlers:
+	upload_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+	upload_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+	upload_logger.addHandler(upload_handler)
+	upload_logger.propagate = False
 
 app = Flask(__name__)
 if HAS_CORS:
@@ -57,6 +69,11 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 upload_progress = {}
 progress_lock = threading.Lock()
 
+# In-memory checksum cache for ultra-fast duplicate detection
+checksum_cache = {}
+checksum_cache_lock = threading.Lock()
+checksum_cache_dirty = False
+
 # HTML template for the web UI
 UI_HTML = '''<!DOCTYPE html>
 <html lang="en">
@@ -72,124 +89,89 @@ UI_HTML = '''<!DOCTYPE html>
 		}
 		
 		body {
-			font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-			background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-			min-height: 100vh;
+			font-family: Arial, sans-serif;
+			background: #f5f5f5;
 			padding: 20px;
 		}
 		
 		.container {
-			max-width: 1400px;
+			max-width: 1200px;
 			margin: 0 auto;
 			background: white;
-			border-radius: 12px;
-			box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-			overflow: hidden;
+			border: 1px solid #ddd;
 		}
 		
 		.header {
-			background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+			background: #333;
 			color: white;
-			padding: 30px;
+			padding: 20px;
 			text-align: center;
 		}
 		
 		.header h1 {
-			font-size: 2.5em;
-			margin-bottom: 10px;
-		}
-		
-		.header p {
-			opacity: 0.9;
-			font-size: 1.1em;
+			font-size: 24px;
+			margin-bottom: 5px;
 		}
 		
 		.stats-bar {
-			background: #f8f9fa;
-			padding: 20px 30px;
+			background: #f9f9f9;
+			padding: 15px;
 			display: flex;
 			justify-content: space-around;
 			flex-wrap: wrap;
-			border-bottom: 2px solid #e9ecef;
+			border-bottom: 1px solid #ddd;
 		}
 		
 		.stat-item {
 			text-align: center;
-			padding: 10px 20px;
+			padding: 10px;
 		}
 		
 		.stat-label {
-			font-size: 0.9em;
-			color: #6c757d;
+			font-size: 12px;
+			color: #666;
 			margin-bottom: 5px;
 		}
 		
 		.stat-value {
-			font-size: 1.8em;
+			font-size: 20px;
 			font-weight: bold;
-			color: #667eea;
+			color: #333;
 		}
 		
 		.controls {
-			padding: 20px 30px;
-			background: #f8f9fa;
+			padding: 15px;
+			background: #f9f9f9;
 			display: flex;
 			justify-content: space-between;
 			align-items: center;
 			flex-wrap: wrap;
-			gap: 15px;
-			border-bottom: 2px solid #e9ecef;
+			gap: 10px;
+			border-bottom: 1px solid #ddd;
 		}
 		
 		.btn {
-			padding: 10px 20px;
-			border: none;
-			border-radius: 6px;
+			padding: 8px 16px;
+			border: 1px solid #ccc;
+			background: white;
 			cursor: pointer;
-			font-size: 1em;
-			font-weight: 600;
-			transition: all 0.3s;
+			font-size: 14px;
 		}
 		
-		.btn-primary {
-			background: #667eea;
-			color: white;
-		}
-		
-		.btn-primary:hover {
-			background: #5568d3;
-			transform: translateY(-2px);
-		}
-		
-		.btn-secondary {
-			background: #6c757d;
-			color: white;
-		}
-		
-		.btn-secondary:hover {
-			background: #5a6268;
-		}
-		
-		.btn-success {
-			background: #28a745;
-			color: white;
-		}
-		
-		.btn-success:hover {
-			background: #218838;
+		.btn:hover {
+			background: #f0f0f0;
 		}
 		
 		.status-indicator {
 			display: inline-block;
-			width: 12px;
-			height: 12px;
+			width: 10px;
+			height: 10px;
 			border-radius: 50%;
-			margin-right: 8px;
+			margin-right: 5px;
 		}
 		
 		.status-active {
 			background: #28a745;
-			box-shadow: 0 0 10px #28a745;
 		}
 		
 		.status-paused {
@@ -197,28 +179,23 @@ UI_HTML = '''<!DOCTYPE html>
 		}
 		
 		.logs-container {
-			padding: 20px 30px;
-			max-height: 600px;
+			padding: 15px;
+			max-height: 500px;
 			overflow-y: auto;
 			background: #1e1e1e;
 		}
 		
 		.logs {
-			font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-			font-size: 0.9em;
-			line-height: 1.6;
+			font-family: 'Courier New', monospace;
+			font-size: 12px;
+			line-height: 1.5;
 		}
 		
 		.log-entry {
-			padding: 8px 12px;
-			margin-bottom: 4px;
-			border-left: 3px solid transparent;
+			padding: 5px 10px;
+			margin-bottom: 2px;
+			border-left: 2px solid transparent;
 			word-wrap: break-word;
-			transition: background 0.2s;
-		}
-		
-		.log-entry:hover {
-			background: rgba(255, 255, 255, 0.05);
 		}
 		
 		.log-entry.info {
@@ -257,7 +234,6 @@ UI_HTML = '''<!DOCTYPE html>
 			text-align: center;
 			color: #858585;
 			padding: 40px;
-			font-size: 1.1em;
 		}
 		
 		.loading {
@@ -265,26 +241,24 @@ UI_HTML = '''<!DOCTYPE html>
 			color: #858585;
 			padding: 20px;
 		}
-		
-		@keyframes pulse {
-			0%, 100% { opacity: 1; }
-			50% { opacity: 0.5; }
-		}
-		
-		.loading::after {
-			content: '...';
-			animation: pulse 1.5s infinite;
-		}
 	</style>
 </head>
 <body>
 	<div class="container">
 		<div class="header">
-			<h1>📱 Flask Backup Receiver</h1>
-			<p>Live Activity Monitor</p>
+			<h1>Flask Backup Receiver</h1>
+			<a href="/shortcut" style="display: inline-block; margin-top: 15px; padding: 10px 20px; background: #007AFF; color: white; text-decoration: none; border-radius: 5px; font-size: 14px;">📱 Installation Instructions</a>
 		</div>
 		
 		<div class="stats-bar">
+			<div class="stat-item">
+				<div class="stat-label">Files Saved</div>
+				<div class="stat-value" id="file-count">0</div>
+			</div>
+			<div class="stat-item">
+				<div class="stat-label">Total Size</div>
+				<div class="stat-value" id="total-size">0 B</div>
+			</div>
 			<div class="stat-item">
 				<div class="stat-label">Active Uploads</div>
 				<div class="stat-value" id="active-uploads">0</div>
@@ -292,10 +266,6 @@ UI_HTML = '''<!DOCTYPE html>
 			<div class="stat-item">
 				<div class="stat-label">Total Sessions</div>
 				<div class="stat-value" id="total-sessions">0</div>
-			</div>
-			<div class="stat-item">
-				<div class="stat-label">Log File Size</div>
-				<div class="stat-value" id="log-size">0 KB</div>
 			</div>
 		</div>
 		
@@ -310,7 +280,17 @@ UI_HTML = '''<!DOCTYPE html>
 			</div>
 			<div>
 				<label>
-					Lines to show:
+					Filter:
+					<select id="filter-select" onchange="updateFilter()">
+						<option value="all" selected>All</option>
+						<option value="info">INFO</option>
+						<option value="debug">DEBUG</option>
+						<option value="warning">WARNING</option>
+						<option value="error">ERROR</option>
+					</select>
+				</label>
+				<label style="margin-left: 15px;">
+					Lines:
 					<select id="lines-select" onchange="updateLines()">
 						<option value="50">50</option>
 						<option value="100" selected>100</option>
@@ -332,8 +312,10 @@ UI_HTML = '''<!DOCTYPE html>
 		let autoRefresh = true;
 		let refreshInterval = null;
 		let currentLines = 100;
+		let currentFilter = 'all';
 		let lastLogCount = 0;
 		let lastLogHash = '';
+		let allLogs = [];
 		
 		function formatBytes(bytes) {
 			if (bytes === 0) return '0 B';
@@ -362,10 +344,17 @@ UI_HTML = '''<!DOCTYPE html>
 		}
 		
 		function scrollToBottom(container) {
-			// Use requestAnimationFrame to ensure DOM is updated before scrolling
-			requestAnimationFrame(() => {
+			// Scroll the logs container (parent) to bottom
+			const logsContainer = document.querySelector('.logs-container');
+			if (logsContainer) {
+				setTimeout(() => {
+					logsContainer.scrollTop = logsContainer.scrollHeight;
+				}, 50);
+			}
+			// Also scroll the container itself as fallback
+			setTimeout(() => {
 				container.scrollTop = container.scrollHeight;
-			});
+			}, 50);
 		}
 		
 		function renderLogs(logs) {
@@ -375,7 +364,20 @@ UI_HTML = '''<!DOCTYPE html>
 				container.innerHTML = '<div class="empty-logs">No logs available</div>';
 				lastLogCount = 0;
 				lastLogHash = '';
+				allLogs = [];
 				return;
+			}
+			
+			// Store all logs for filtering
+			allLogs = logs;
+			
+			// Filter logs based on current filter
+			let filteredLogs = logs;
+			if (currentFilter !== 'all') {
+				filteredLogs = logs.filter(log => {
+					const entry = parseLogEntry(log.trim());
+					return entry.level === currentFilter;
+				});
 			}
 			
 			// Create a hash of the last log entry to detect new logs
@@ -384,20 +386,34 @@ UI_HTML = '''<!DOCTYPE html>
 			
 			// Always update if there are new logs or count changed
 			if (hasNewLogs || logs.length !== lastLogCount) {
-				container.innerHTML = logs.map(log => {
-					const entry = parseLogEntry(log.trim());
-					return `<div class="log-entry ${entry.level}">
-						<span class="log-time">${entry.time || ''}</span>
-						<span class="log-level">${entry.level}</span>
-						<span class="log-message">${escapeHtml(entry.message)}</span>
-					</div>`;
-				}).join('');
+				if (filteredLogs.length === 0) {
+					container.innerHTML = '<div class="empty-logs">No logs match the selected filter</div>';
+				} else {
+					container.innerHTML = filteredLogs.map(log => {
+						const entry = parseLogEntry(log.trim());
+						return `<div class="log-entry ${entry.level}">
+							<span class="log-time">${entry.time || ''}</span>
+							<span class="log-level">${entry.level}</span>
+							<span class="log-message">${escapeHtml(entry.message)}</span>
+						</div>`;
+					}).join('');
+				}
 				
 				lastLogCount = logs.length;
 				lastLogHash = currentLogHash;
 				
-				// Always scroll to bottom when logs are updated
-				scrollToBottom(container);
+				// Always scroll to bottom when new logs are detected
+				if (hasNewLogs) {
+					scrollToBottom(container);
+				}
+			}
+		}
+		
+		function updateFilter() {
+			currentFilter = document.getElementById('filter-select').value;
+			// Re-render with current filter
+			if (allLogs.length > 0) {
+				renderLogs(allLogs);
 			}
 		}
 		
@@ -428,9 +444,10 @@ UI_HTML = '''<!DOCTYPE html>
 				const data = await response.json();
 				
 				if (data.success) {
+					document.getElementById('file-count').textContent = data.file_count.toLocaleString();
+					document.getElementById('total-size').textContent = formatBytes(data.total_files_size || 0);
 					document.getElementById('active-uploads').textContent = data.active_uploads;
 					document.getElementById('total-sessions').textContent = data.total_sessions;
-					document.getElementById('log-size').textContent = formatBytes(data.log_file_size);
 				}
 			} catch (error) {
 				console.error('Error fetching stats:', error);
@@ -494,25 +511,52 @@ UI_HTML = '''<!DOCTYPE html>
 
 def load_checksum_db():
 	"""
-	Load the checksum database from disk.
-	Returns a dictionary mappi	ng checksum -> file path.
+	Load the checksum database from disk (with caching).
+	Returns a dictionary mapping checksum -> file path.
 	"""
+	global checksum_cache
+	
+	with checksum_cache_lock:
+		if checksum_cache:
+			return checksum_cache.copy()
+	
 	if os.path.exists(CHECKSUM_DB_PATH):
 		try:
 			with open(CHECKSUM_DB_PATH, 'r', encoding='utf-8') as f:
-				return json.load(f)
+				db = json.load(f)
+				with checksum_cache_lock:
+					checksum_cache = db
+				return db
 		except Exception as e:
 			logger.warning(f"Could not load checksum database: {e}")
 			return {}
 	return {}
 
-def save_checksum_db(checksum_db):
+def save_checksum_db(checksum_db, immediate=False):
 	"""
-	Save the checksum database to disk.
+	Save the checksum database to disk (with caching and async writes).
 	"""
+	global checksum_cache, checksum_cache_dirty
+	
+	with checksum_cache_lock:
+		checksum_cache = checksum_db.copy()
+		checksum_cache_dirty = True
+	
+	# Save immediately if requested, otherwise save in background
+	if immediate:
+		_save_checksum_db_sync(checksum_db)
+	else:
+		# Save in background thread to avoid blocking
+		threading.Thread(target=_save_checksum_db_sync, args=(checksum_db,), daemon=True).start()
+
+def _save_checksum_db_sync(checksum_db):
+	"""Synchronous save operation."""
 	try:
-		with open(CHECKSUM_DB_PATH, 'w', encoding='utf-8') as f:
-			json.dump(checksum_db, f, indent=2)
+		# Use atomic write: write to temp file then rename
+		temp_path = CHECKSUM_DB_PATH + '.tmp'
+		with open(temp_path, 'w', encoding='utf-8') as f:
+			json.dump(checksum_db, f, separators=(',', ':'))  # Compact JSON for speed
+		os.replace(temp_path, CHECKSUM_DB_PATH)
 	except Exception as e:
 		logger.warning(f"Could not save checksum database: {e}")
 
@@ -556,7 +600,7 @@ def is_duplicate(checksum, checksum_db):
 		else:
 			# File was deleted, remove from database
 			del checksum_db[checksum]
-			save_checksum_db(checksum_db)
+			save_checksum_db(checksum_db, immediate=False)
 	return False, None
 
 def get_image_date(image_data):
@@ -638,12 +682,13 @@ def convert_quicktime_to_mp4(input_path, output_path, session_id=None):
 	"""
 	# Check if ffmpeg is available before attempting conversion
 	if not check_ffmpeg_available():
-		logger.error("ffmpeg not found. Please install ffmpeg to convert video files.")
+		# Log as warning since videos are still saved without conversion
+		logger.warning("ffmpeg not found. Videos will be saved without conversion. Install ffmpeg to enable .quicktime to .mp4 conversion.")
 		if session_id:
 			with progress_lock:
 				if session_id in upload_progress:
 					upload_progress[session_id]['status'] = 'ffmpeg_not_found'
-					upload_progress[session_id]['error'] = 'ffmpeg not found. Please install ffmpeg to convert video files.'
+					upload_progress[session_id]['warning'] = 'ffmpeg not found. Video saved without conversion.'
 		return False
 	
 	try:
@@ -666,7 +711,7 @@ def convert_quicktime_to_mp4(input_path, output_path, session_id=None):
 		)
 		
 		if result.returncode == 0:
-			logger.info(f"Successfully converted {input_path} to {output_path}")
+			# Conversion success - don't log to reduce spam
 			if session_id:
 				with progress_lock:
 					if session_id in upload_progress:
@@ -683,11 +728,418 @@ def convert_quicktime_to_mp4(input_path, output_path, session_id=None):
 		logger.error(f"FFmpeg conversion timed out for {input_path}")
 		return False
 	except FileNotFoundError:
-		logger.error("ffmpeg not found. Please install ffmpeg to convert video files.")
+		logger.warning("ffmpeg not found. Videos will be saved without conversion.")
 		return False
 	except Exception as e:
 		logger.error(f"Error converting quicktime to mp4: {e}", exc_info=True)
 		return False
+
+@app.route("/download-shortcut", methods=["GET"])
+def download_shortcut():
+	"""
+	Generate and serve a downloadable iOS Shortcuts shortcut file.
+	When downloaded on iPhone, it will automatically open in Shortcuts app.
+	"""
+	# Get server IP and port from request
+	host = request.host
+	upload_url = f"http://{host}/upload"
+	
+	# Generate UUIDs for the shortcut
+	shortcut_uuid = str(uuid.uuid4()).upper()
+	action_uuid1 = str(uuid.uuid4()).upper()
+	action_uuid2 = str(uuid.uuid4()).upper()
+	output_uuid = str(uuid.uuid4()).upper()
+	
+	# Create iOS Shortcuts plist structure using plistlib
+	shortcut_data = {
+		'WFWorkflowActions': [
+			{
+				'WFWorkflowActionIdentifier': 'is.workflow.actions.selectphotos',
+				'WFWorkflowActionParameters': {
+					'SelectMultiple': True,
+					'SelectPhotos': 0
+				},
+				'WFWorkflowActionUUID': action_uuid1
+			},
+			{
+				'WFWorkflowActionIdentifier': 'is.workflow.actions.getcontentsofurl',
+				'WFWorkflowActionParameters': {
+					'WFHTTPMethod': 'POST',
+					'WFURL': upload_url,
+					'WFHTTPBodyType': 'File',
+					'WFHTTPBody': {
+						'Value': {
+							'attachmentsByRange': {
+								'{0, 1}': {
+									'OutputName': 'Photos',
+									'OutputUUID': output_uuid,
+									'Type': 'ActionOutput'
+								}
+							}
+						},
+						'WFSerializationType': 'WFTextTokenAttachment'
+					}
+				},
+				'WFWorkflowActionUUID': action_uuid2
+			}
+		],
+		'WFWorkflowClientRelease': '2.0',
+		'WFWorkflowClientVersion': '900',
+		'WFWorkflowIcon': {
+			'WFWorkflowIconGlyphNumber': 59511,
+			'WFWorkflowIconStartColor': 4282601983
+		},
+		'WFWorkflowInputContentItemClasses': [
+			'WFPhotoMediaContentItem',
+			'WFGenericFileContentItem'
+		],
+		'WFWorkflowMinimumClientVersion': 900,
+		'WFWorkflowMinimumClientRelease': '2.0',
+		'WFWorkflowTypes': [
+			'NCWidget',
+			'WatchKit'
+		]
+	}
+	
+	# Create binary plist
+	plist_buffer = BytesIO()
+	plistlib.dump(shortcut_data, plist_buffer, fmt=plistlib.FMT_BINARY)
+	plist_buffer.seek(0)
+	
+	# Return as downloadable file
+	response = Response(
+		plist_buffer.getvalue(),
+		mimetype='application/x-plist',
+		headers={
+			'Content-Disposition': 'attachment; filename="Backup-to-Server.shortcut"'
+		}
+	)
+	return response
+
+@app.route("/static/<filename>", methods=["GET"])
+def serve_static(filename):
+	"""
+	Serve static files like images.
+	"""
+	try:
+		file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+		if os.path.exists(file_path) and os.path.isfile(file_path):
+			# Determine content type
+			if filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+				mimetype = 'image/jpeg'
+			elif filename.lower().endswith('.png'):
+				mimetype = 'image/png'
+			elif filename.lower().endswith('.gif'):
+				mimetype = 'image/gif'
+			else:
+				mimetype = 'application/octet-stream'
+			
+			with open(file_path, 'rb') as f:
+				return Response(f.read(), mimetype=mimetype)
+		else:
+			return jsonify({"error": "File not found"}), 404
+	except Exception as e:
+		logger.error(f"Error serving static file: {e}", exc_info=True)
+		return jsonify({"error": str(e)}), 500
+
+@app.route("/shortcut", methods=["GET"])
+def get_shortcut():
+	"""
+	Generate and serve an iOS Shortcuts shortcut installation page.
+	Provides instructions and shortcut URL for automatic server connection.
+	"""
+	# Get server IP and port from request
+	host = request.host
+	upload_url = f"http://{host}/upload"
+	
+	# Create a shortcut installation page with instructions
+	shortcut_html = f'''<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Install Backup Shortcut</title>
+	<style>
+		body {{
+			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+			padding: 15px;
+			background: #f5f5f5;
+			margin: 0;
+		}}
+		.container {{
+			background: white;
+			padding: 20px;
+			border-radius: 8px;
+			max-width: 550px;
+			margin: 0 auto;
+			box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+		}}
+		h1 {{
+			color: #333;
+			margin-bottom: 8px;
+			font-size: 22px;
+			font-weight: 600;
+		}}
+		.container > p {{
+			color: #666;
+			margin-bottom: 20px;
+			font-size: 14px;
+			line-height: 1.5;
+		}}
+		.step {{
+			margin: 15px 0;
+			padding: 12px;
+			background: #f8f9fa;
+			border-left: 3px solid #007AFF;
+			border-radius: 4px;
+		}}
+		.step h3 {{
+			color: #007AFF;
+			margin-top: 0;
+			margin-bottom: 8px;
+			font-size: 16px;
+			font-weight: 600;
+		}}
+		.step p {{
+			color: #555;
+			margin: 6px 0;
+			line-height: 1.4;
+			font-size: 13px;
+		}}
+		.step ul {{
+			margin: 8px 0;
+			padding-left: 18px;
+			color: #555;
+			font-size: 13px;
+		}}
+		.step ul li {{
+			margin: 4px 0;
+			line-height: 1.4;
+		}}
+		.step a {{
+			color: #007AFF;
+			text-decoration: none;
+			font-weight: 500;
+		}}
+		.step a:hover {{
+			text-decoration: underline;
+		}}
+		.step img {{
+			max-width: 200px;
+			width: 100%;
+			height: auto;
+			margin: 10px auto;
+			display: block;
+			border-radius: 6px;
+			box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+			border: 1px solid #e0e0e0;
+		}}
+		.step a img {{
+			cursor: pointer;
+			transition: opacity 0.2s;
+		}}
+		.step a:hover img {{
+			opacity: 0.8;
+		}}
+		.code {{
+			background: #1e1e1e;
+			color: #d4d4d4;
+			padding: 8px 12px;
+			border-radius: 4px;
+			font-family: 'Courier New', monospace;
+			font-size: 11px;
+			word-break: break-all;
+			margin: 8px 0;
+			border: 1px solid #333;
+		}}
+		.btn {{
+			display: inline-block;
+			padding: 8px 16px;
+			background: #007AFF;
+			color: white;
+			text-decoration: none;
+			border-radius: 6px;
+			margin: 8px 4px;
+			font-size: 13px;
+			font-weight: 500;
+		}}
+		.btn:hover {{
+			background: #0056CC;
+		}}
+	</style>
+</head>
+<body>
+	<div class="container">
+		<h1>📱 Install Backup Shortcut</h1>
+		<p>Create a Shortcuts workflow to automatically backup photos/videos to this server.</p>
+		
+		<div class="step">
+			<h3>Step 1: Scan QR Code</h3>
+			<p><strong>Requirements:</strong></p>
+			<ul>
+				<li>iPhone and PC should be on the same network</li>
+				<li>iPhone Shortcuts app should be installed on phone (<a href="https://apps.apple.com/app/shortcuts/id915249334" target="_blank">Download from App Store</a>)</li>
+			</ul>
+			<p>Scan the QR code below with your iPhone camera to open the shortcut setup.</p>
+			<a href="shortcuts://shortcuts/f067a6f17204474ab3e8029c94e4356a" style="display: block; text-align: center;">
+				<img src="/static/qrcode.png" alt="QR Code" style="cursor: pointer;" />
+			</a>
+			<p style="font-size: 12px; color: #666; margin-top: 8px;">
+				Or <a href="https://www.icloud.com/shortcuts/f067a6f17204474ab3e8029c94e4356a" target="_blank">open in browser</a>
+			</p>
+		</div>
+		
+		<div class="step">
+			<h3>Step 2: Open Shortcuts App</h3>
+			<p>Open the Shortcuts app on your iPhone.</p>
+			<img src="/static/step1.jpg" alt="Step 2: Open Shortcuts App" />
+		</div>
+		
+		<div class="step">
+			<h3>Step 3: Add Actions</h3>
+			<p>Copy the setup shown in the screenshot below. Replace the URL in the screenshot with:</p>
+			<div class="code">{upload_url}</div>
+			<img src="/static/step2.jpg" alt="Step 3: Add Actions" />
+		</div>
+		
+		<div class="step">
+			<h3>Step 4: Save Shortcut</h3>
+			<p>Name it "Backup to Server" and save.</p>
+		</div>
+		
+		<p style="margin-top: 20px; font-size: 12px; color: #666;">
+			Server URL: <code>{upload_url}</code>
+		</p>
+	</div>
+</body>
+</html>'''
+	
+	return render_template_string(shortcut_html)
+
+@app.route("/connect", methods=["GET"])
+@app.route("/q", methods=["GET"])
+def mobile_connect():
+	"""
+	Mobile-friendly connection page for server connection.
+	"""
+	# Get server IP and port from request
+	host = request.host
+	upload_url = f"http://{host}/upload"
+	shortcut_url = f"http://{host}/shortcut"
+	
+	mobile_html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Connect to Backup Server</title>
+	<style>
+		* {{
+			margin: 0;
+			padding: 0;
+			box-sizing: border-box;
+		}}
+		body {{
+			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+			background: #f5f5f5;
+			padding: 20px;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			min-height: 100vh;
+		}}
+		.container {{
+			background: white;
+			border: 1px solid #ddd;
+			padding: 30px;
+			max-width: 400px;
+			width: 100%;
+			text-align: center;
+		}}
+		.icon {{
+			font-size: 64px;
+			margin-bottom: 20px;
+		}}
+		h1 {{
+			font-size: 24px;
+			margin-bottom: 10px;
+			color: #333;
+		}}
+		.info {{
+			color: #666;
+			font-size: 14px;
+			margin-bottom: 20px;
+			line-height: 1.5;
+		}}
+		.url-box {{
+			background: #f9f9f9;
+			border: 1px solid #ddd;
+			padding: 15px;
+			margin: 20px 0;
+			word-break: break-all;
+			font-family: monospace;
+			font-size: 12px;
+			color: #333;
+		}}
+		.btn {{
+			display: inline-block;
+			padding: 12px 24px;
+			background: #007AFF;
+			color: white;
+			text-decoration: none;
+			border-radius: 6px;
+			margin: 10px 5px;
+			font-size: 16px;
+		}}
+		.btn:hover {{
+			background: #0056CC;
+		}}
+		.btn-secondary {{
+			background: #6c757d;
+		}}
+		.btn-secondary:hover {{
+			background: #5a6268;
+		}}
+		.status {{
+			margin-top: 20px;
+			padding: 10px;
+			background: #d4edda;
+			border: 1px solid #c3e6cb;
+			color: #155724;
+			border-radius: 4px;
+			font-size: 14px;
+		}}
+	</style>
+</head>
+<body>
+	<div class="container">
+		<div class="icon">📱</div>
+		<h1>Backup Server Connected</h1>
+		<p class="info">Your device is connected to the backup server. You can now upload your files.</p>
+		
+		<div class="url-box">
+			{upload_url}
+		</div>
+		
+		<div>
+			<a href="/" class="btn">View Dashboard</a>
+			<a href="{shortcut_url}" class="btn btn-secondary">Install Shortcut</a>
+		</div>
+		
+		<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+			<p style="font-size: 12px; color: #666; margin-bottom: 10px;">Upload endpoint:</p>
+			<div class="url-box" style="font-size: 11px;">
+				POST {upload_url}
+			</div>
+		</div>
+		
+		<div class="status">
+			✓ Server is running and ready to receive files
+		</div>
+	</div>
+</body>
+</html>'''
+	return render_template_string(mobile_html)
 
 @app.route("/", methods=["GET"])
 def index():
@@ -726,6 +1178,48 @@ def get_logs():
 			'error': str(e)
 		}), 500
 
+def count_files_in_directory(directory):
+	"""
+	Count total number of files in directory (recursively).
+	Excludes hidden files and directories.
+	"""
+	try:
+		count = 0
+		for root, dirs, files in os.walk(directory):
+			# Skip hidden directories
+			dirs[:] = [d for d in dirs if not d.startswith('.')]
+			# Count files (excluding hidden files)
+			count += len([f for f in files if not f.startswith('.')])
+		return count
+	except Exception as e:
+		logger.warning(f"Error counting files: {e}")
+		return 0
+
+def get_total_files_size(directory):
+	"""
+	Calculate total size of all files in directory (recursively).
+	Excludes hidden files and directories.
+	Returns size in bytes.
+	"""
+	try:
+		total_size = 0
+		for root, dirs, files in os.walk(directory):
+			# Skip hidden directories
+			dirs[:] = [d for d in dirs if not d.startswith('.')]
+			# Calculate size of files (excluding hidden files)
+			for file in files:
+				if not file.startswith('.'):
+					file_path = os.path.join(root, file)
+					try:
+						total_size += os.path.getsize(file_path)
+					except (OSError, FileNotFoundError):
+						# Skip files that can't be accessed
+						continue
+		return total_size
+	except Exception as e:
+		logger.warning(f"Error calculating total file size: {e}")
+		return 0
+
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
 	"""
@@ -741,11 +1235,19 @@ def get_stats():
 		if os.path.exists(LOG_FILE):
 			log_size = os.path.getsize(LOG_FILE)
 		
+		# Count files in save directory
+		file_count = count_files_in_directory(SAVE_DIR)
+		
+		# Calculate total size of all uploaded files
+		total_files_size = get_total_files_size(SAVE_DIR)
+		
 		return jsonify({
 			'success': True,
 			'active_uploads': active_uploads,
 			'total_sessions': total_sessions,
 			'log_file_size': log_size,
+			'file_count': file_count,
+			'total_files_size': total_files_size,
 			'save_directory': SAVE_DIR
 		}), 200
 	except Exception as e:
@@ -783,14 +1285,8 @@ def upload():
 		}
 	
 	# Debug: Log request details
-	logger.debug(f"Content-Type: {request.content_type}")
-	logger.debug(f"Content-Length: {request.content_length}")
-	logger.debug(f"Session ID: {session_id}")
-	
 	# Handle multipart/form-data file uploads
 	if request.files:
-		logger.debug(f"Files in request: {list(request.files.keys())}")
-		logger.debug(f"Form data: {list(request.form.keys())}")
 		
 		if "file" not in request.files:
 			logger.error(f"'file' key not found. Available keys: {list(request.files.keys())}")
@@ -819,8 +1315,9 @@ def upload():
 		temp_path = temp_file.name
 		sha256 = hashlib.sha256()
 		
-		# Stream file and calculate checksum simultaneously
+		# Stream file and calculate checksum simultaneously with optimized I/O
 		file.seek(0)
+		last_progress_update = 0
 		while True:
 			chunk = file.read(CHUNK_SIZE)
 			if not chunk:
@@ -829,21 +1326,23 @@ def upload():
 			sha256.update(chunk)
 			file_size += len(chunk)
 			
-			# Update progress
-			with progress_lock:
-				if session_id in upload_progress:
-					upload_progress[session_id]['bytes_received'] = file_size
-					if total_size:
-						upload_progress[session_id]['total_bytes'] = total_size
+			# Update progress less frequently for better performance
+			if file_size - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+				with progress_lock:
+					if session_id in upload_progress:
+						upload_progress[session_id]['bytes_received'] = file_size
+						if total_size:
+							upload_progress[session_id]['total_bytes'] = total_size
+				last_progress_update = file_size
 		
 		temp_file.close()
 		checksum = sha256.hexdigest()
 		
-		# Check for duplicates
+		# Check for duplicates (using cached DB for speed)
 		checksum_db = load_checksum_db()
 		is_dup, existing_path = is_duplicate(checksum, checksum_db)
 		if is_dup:
-			logger.info(f"Duplicate file detected (checksum: {checksum[:16]}...). Existing file: {existing_path}")
+			# Duplicate detected - don't log to reduce spam
 			os.remove(temp_path)
 			with progress_lock:
 				if session_id in upload_progress:
@@ -859,17 +1358,31 @@ def upload():
 		image_date = datetime.now()
 		if file.content_type and file.content_type.startswith("image/"):
 			image_date = get_image_date(sample_data)
+		elif file.content_type and file.content_type.startswith("video/"):
+			# For video files, use current date (could be enhanced to extract video metadata)
+			image_date = datetime.now()
 		else:
-			# For non-image files, use current date
+			# For other files, use current date
 			image_date = datetime.now()
 		
 		# Get year folder path
 		year = image_date.year
 		year_folder = get_year_folder_path(year)
 		
-		# Check if file is .quicktime or video/quicktime content type and convert to .mp4
-		is_quicktime = (filename.lower().endswith('.quicktime') or 
+		# Check if file is a video file (various formats)
+		filename_lower = filename.lower()
+		is_video = (
+			filename_lower.endswith('.mov') or
+			filename_lower.endswith('.mp4') or
+			filename_lower.endswith('.m4v') or
+			filename_lower.endswith('.quicktime') or
+			(file.content_type and file.content_type.lower().startswith('video/'))
+		)
+		
+		# Only convert .quicktime files to .mp4, save other videos as-is
+		is_quicktime = (filename_lower.endswith('.quicktime') or 
 		               (file.content_type and file.content_type.lower() == 'video/quicktime'))
+		
 		if is_quicktime:
 			# Move temp file to year folder
 			temp_final_path = os.path.join(year_folder, filename)
@@ -890,7 +1403,7 @@ def upload():
 				if convert_quicktime_to_mp4(temp_final_path, save_path, session_id):
 					try:
 						os.remove(temp_final_path)
-						logger.info(f"Removed original .quicktime file: {temp_final_path}")
+						# File removal - don't log to reduce spam
 					except Exception as e:
 						logger.warning(f"Could not remove original file {temp_final_path}: {e}")
 					
@@ -902,7 +1415,7 @@ def upload():
 					checksum_db = load_checksum_db()
 					checksum_db[checksum] = save_path
 					checksum_db[final_checksum] = save_path
-					save_checksum_db(checksum_db)
+					save_checksum_db(checksum_db, immediate=False)
 					
 					with progress_lock:
 						if session_id in upload_progress:
@@ -912,7 +1425,7 @@ def upload():
 					# Conversion failed or ffmpeg not found, keep original
 					checksum_db = load_checksum_db()
 					checksum_db[checksum] = temp_final_path
-					save_checksum_db(checksum_db)
+					save_checksum_db(checksum_db, immediate=False)
 					
 					with progress_lock:
 						if session_id in upload_progress:
@@ -934,15 +1447,17 @@ def upload():
 			
 			# Store checksum in database
 			checksum_db[checksum] = save_path
-			save_checksum_db(checksum_db)
+			save_checksum_db(checksum_db, immediate=False)
 			
 			with progress_lock:
 				if session_id in upload_progress:
 					upload_progress[session_id]['status'] = 'completed'
 					upload_progress[session_id]['file_path'] = save_path
-		
-		logger.info(f"Successfully received and saved: {save_path} (Year: {year}, Checksum: {checksum[:16]}...)")
-		return jsonify({"status": "ok", "session_id": session_id, "file_path": save_path}), 200
+			
+			# Log successful upload (including videos)
+			file_type = "video" if is_video else "file"
+			upload_logger.info(f"Successfully received and saved {file_type}: {save_path} (Year: {year}, Checksum: {checksum[:16]}...)")
+			return jsonify({"status": "ok", "session_id": session_id, "file_path": save_path}), 200
 	
 	# Handle raw binary data (e.g., Content-Type: image/png)
 	if request.content_type and request.content_type.startswith("image/"):
@@ -952,7 +1467,8 @@ def upload():
 		sha256 = hashlib.sha256()
 		file_size = 0
 		
-		# Stream request data
+		# Stream request data with optimized progress updates
+		last_progress_update = 0
 		for chunk in request.stream:
 			if not chunk:
 				break
@@ -960,10 +1476,12 @@ def upload():
 			sha256.update(chunk)
 			file_size += len(chunk)
 			
-			# Update progress
-			with progress_lock:
-				if session_id in upload_progress:
-					upload_progress[session_id]['bytes_received'] = file_size
+			# Update progress less frequently for better performance
+			if file_size - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+				with progress_lock:
+					if session_id in upload_progress:
+						upload_progress[session_id]['bytes_received'] = file_size
+				last_progress_update = file_size
 		
 		temp_file.close()
 		checksum = sha256.hexdigest()
@@ -980,7 +1498,7 @@ def upload():
 		checksum_db = load_checksum_db()
 		is_dup, existing_path = is_duplicate(checksum, checksum_db)
 		if is_dup:
-			logger.info(f"Duplicate file detected (checksum: {checksum[:16]}...). Existing file: {existing_path}")
+			# Duplicate detected - don't log to reduce spam
 			os.remove(temp_path)
 			with progress_lock:
 				if session_id in upload_progress:
@@ -988,9 +1506,9 @@ def upload():
 					upload_progress[session_id]['file_path'] = existing_path
 			return jsonify({"status": "duplicate", "session_id": session_id, "existing_path": existing_path}), 200
 		
-		# Read sample for date extraction
-		with open(temp_path, 'rb') as f:
-			sample_data = f.read(64 * 1024)
+		# Read sample for date extraction (optimized buffer size)
+		with open(temp_path, 'rb', buffering=32768) as f:
+			sample_data = f.read(32 * 1024)
 		
 		# Extract date from image data
 		image_date = get_image_date(sample_data)
@@ -1020,16 +1538,17 @@ def upload():
 		# Move temp file to final location
 		os.rename(temp_path, save_path)
 		
-		# Store checksum in database
+		# Store checksum in database (async save for speed)
 		checksum_db[checksum] = save_path
-		save_checksum_db(checksum_db)
+		save_checksum_db(checksum_db, immediate=False)
 		
 		with progress_lock:
 			if session_id in upload_progress:
 				upload_progress[session_id]['status'] = 'completed'
 				upload_progress[session_id]['file_path'] = save_path
 		
-		logger.info(f"Successfully received and saved raw image: {save_path} ({file_size} bytes, Year: {year}, Checksum: {checksum[:16]}...)")
+		# Log successful upload
+		upload_logger.info(f"Successfully received and saved raw image: {save_path} ({file_size} bytes, Year: {year}, Checksum: {checksum[:16]}...)")
 		return jsonify({"status": "ok", "session_id": session_id, "file_path": save_path}), 200
 	
 	# Handle other raw binary data
@@ -1039,7 +1558,8 @@ def upload():
 	sha256 = hashlib.sha256()
 	file_size = 0
 	
-	# Stream request data
+	# Stream request data with optimized progress updates
+	last_progress_update = 0
 	for chunk in request.stream:
 		if not chunk:
 			break
@@ -1047,10 +1567,12 @@ def upload():
 		sha256.update(chunk)
 		file_size += len(chunk)
 		
-		# Update progress
-		with progress_lock:
-			if session_id in upload_progress:
-				upload_progress[session_id]['bytes_received'] = file_size
+		# Update progress less frequently for better performance
+		if file_size - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+			with progress_lock:
+				if session_id in upload_progress:
+					upload_progress[session_id]['bytes_received'] = file_size
+			last_progress_update = file_size
 	
 	temp_file.close()
 	
@@ -1068,7 +1590,7 @@ def upload():
 	# Check for duplicates
 	is_dup, existing_path = is_duplicate(checksum, checksum_db)
 	if is_dup:
-		logger.info(f"Duplicate file detected (checksum: {checksum[:16]}...). Existing file: {existing_path}")
+		# Duplicate detected - don't log to reduce spam
 		os.remove(temp_path)
 		with progress_lock:
 			if session_id in upload_progress:
@@ -1091,8 +1613,16 @@ def upload():
 		if request.content_type:
 			# Try to extract extension from content type
 			content_type_lower = request.content_type.lower()
-			if content_type_lower == 'video/quicktime':
-				ext = "quicktime"
+			if content_type_lower.startswith('video/'):
+				# Map common video content types to extensions
+				video_ext_map = {
+					'video/quicktime': 'mov',
+					'video/mp4': 'mp4',
+					'video/x-m4v': 'm4v',
+					'video/mpeg': 'mpg',
+					'video/avi': 'avi'
+				}
+				ext = video_ext_map.get(content_type_lower, 'mov')  # Default to .mov for videos
 			else:
 				parts = request.content_type.split("/")
 				if len(parts) > 1:
@@ -1112,9 +1642,20 @@ def upload():
 	# Move temp file to final location
 	os.rename(temp_path, save_path)
 	
-	# Check if file is .quicktime or video/quicktime content type and convert to .mp4
-	is_quicktime = (filename.lower().endswith('.quicktime') or 
+	# Check if file is a video file (various formats)
+	filename_lower = filename.lower() if filename else ''
+	is_video = (
+		filename_lower.endswith('.mov') or
+		filename_lower.endswith('.mp4') or
+		filename_lower.endswith('.m4v') or
+		filename_lower.endswith('.quicktime') or
+		(request.content_type and request.content_type.lower().startswith('video/'))
+	)
+	
+	# Only convert .quicktime files to .mp4, save other videos as-is
+	is_quicktime = (filename_lower.endswith('.quicktime') or 
 	               (request.content_type and request.content_type.lower() == 'video/quicktime'))
+	
 	if is_quicktime:
 		# Generate output filename with .mp4 extension
 		base_name = os.path.splitext(filename)[0]
@@ -1131,7 +1672,7 @@ def upload():
 			if convert_quicktime_to_mp4(save_path, output_path, session_id):
 				try:
 					os.remove(save_path)
-					logger.info(f"Removed original .quicktime file: {save_path}")
+					# File removal - don't log to reduce spam
 				except Exception as e:
 					logger.warning(f"Could not remove original file {save_path}: {e}")
 				
@@ -1143,7 +1684,7 @@ def upload():
 				checksum_db = load_checksum_db()
 				checksum_db[checksum] = output_path
 				checksum_db[final_checksum] = output_path
-				save_checksum_db(checksum_db)
+				save_checksum_db(checksum_db, immediate=False)
 				
 				with progress_lock:
 					if session_id in upload_progress:
@@ -1153,7 +1694,7 @@ def upload():
 				# Conversion failed or ffmpeg not found, keep original
 				checksum_db = load_checksum_db()
 				checksum_db[checksum] = save_path
-				save_checksum_db(checksum_db)
+				save_checksum_db(checksum_db, immediate=False)
 				
 				with progress_lock:
 					if session_id in upload_progress:
@@ -1167,26 +1708,28 @@ def upload():
 		
 		threading.Thread(target=convert_in_background, daemon=True).start()
 	else:
-		# Store checksum in database
+		# Store checksum in database (async save for speed)
 		checksum_db[checksum] = save_path
-		save_checksum_db(checksum_db)
+		save_checksum_db(checksum_db, immediate=False)
 		
 		with progress_lock:
 			if session_id in upload_progress:
 				upload_progress[session_id]['status'] = 'completed'
 				upload_progress[session_id]['file_path'] = save_path
 	
-	logger.info(f"Successfully received and saved raw data: {save_path} ({file_size} bytes, Year: {year}, Checksum: {checksum[:16]}...)")
+	# Log successful upload
+	upload_logger.info(f"Successfully received and saved raw data: {save_path} ({file_size} bytes, Year: {year}, Checksum: {checksum[:16]}...)")
 	return jsonify({"status": "ok", "session_id": session_id, "file_path": save_path}), 200
 	
 
 if __name__ == "__main__":
-	logger.info("Starting Flask backup receiver on 0.0.0.0:5001")
-	logger.info(f"Save directory: {SAVE_DIR}")
-	logger.info(f"Log file: {LOG_FILE}")
+	# Only log startup once, use print for visibility
+	print(f"Starting Flask backup receiver on 0.0.0.0:5001")
+	print(f"Save directory: {SAVE_DIR}")
+	print(f"Log file: {LOG_FILE}")
 	try:
 		app.run(host="0.0.0.0", port=5001, debug=False)
 	except KeyboardInterrupt:
-		logger.info("Shutting down Flask backup receiver...")
+		print("Shutting down Flask backup receiver...")
 	except Exception as e:
 		logger.error(f"Error running Flask app: {e}", exc_info=True)

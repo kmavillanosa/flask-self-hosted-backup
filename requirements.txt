@@ -1,5 +1,7 @@
 flask
 flask-cors
 pillow
+waitress
+qrcode[pil]
 pywin32; sys_platform == 'win32'
 
