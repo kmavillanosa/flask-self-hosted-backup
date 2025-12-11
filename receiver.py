@@ -333,6 +333,7 @@ UI_HTML = '''<!DOCTYPE html>
 		let refreshInterval = null;
 		let currentLines = 100;
 		let lastLogCount = 0;
+		let lastLogHash = '';
 		
 		function formatBytes(bytes) {
 			if (bytes === 0) return '0 B';
@@ -360,31 +361,44 @@ UI_HTML = '''<!DOCTYPE html>
 			};
 		}
 		
+		function scrollToBottom(container) {
+			// Use requestAnimationFrame to ensure DOM is updated before scrolling
+			requestAnimationFrame(() => {
+				container.scrollTop = container.scrollHeight;
+			});
+		}
+		
 		function renderLogs(logs) {
 			const container = document.getElementById('logs');
 			
 			if (!logs || logs.length === 0) {
 				container.innerHTML = '<div class="empty-logs">No logs available</div>';
+				lastLogCount = 0;
+				lastLogHash = '';
 				return;
 			}
 			
-			// Only update if there are new logs
-			if (logs.length === lastLogCount && lastLogCount > 0) {
-				return;
+			// Create a hash of the last log entry to detect new logs
+			const currentLogHash = logs.length > 0 ? logs[logs.length - 1].trim() : '';
+			const hasNewLogs = logs.length > lastLogCount || (logs.length > 0 && currentLogHash !== lastLogHash);
+			
+			// Always update if there are new logs or count changed
+			if (hasNewLogs || logs.length !== lastLogCount) {
+				container.innerHTML = logs.map(log => {
+					const entry = parseLogEntry(log.trim());
+					return `<div class="log-entry ${entry.level}">
+						<span class="log-time">${entry.time || ''}</span>
+						<span class="log-level">${entry.level}</span>
+						<span class="log-message">${escapeHtml(entry.message)}</span>
+					</div>`;
+				}).join('');
+				
+				lastLogCount = logs.length;
+				lastLogHash = currentLogHash;
+				
+				// Always scroll to bottom when logs are updated
+				scrollToBottom(container);
 			}
-			lastLogCount = logs.length;
-			
-			container.innerHTML = logs.map(log => {
-				const entry = parseLogEntry(log.trim());
-				return `<div class="log-entry ${entry.level}">
-					<span class="log-time">${entry.time || ''}</span>
-					<span class="log-level">${entry.level}</span>
-					<span class="log-message">${escapeHtml(entry.message)}</span>
-				</div>`;
-			}).join('');
-			
-			// Auto-scroll to bottom
-			container.scrollTop = container.scrollHeight;
 		}
 		
 		function escapeHtml(text) {
