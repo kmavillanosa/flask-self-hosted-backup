@@ -1,0 +1,5 @@
+flask
+flask-cors
+pillow
+pywin32; sys_platform == 'win32'
+
