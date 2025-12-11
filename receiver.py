@@ -20,12 +20,87 @@ try:
 except ImportError:
 	HAS_CORS = False
 
-SAVE_DIR = r"C:\Users\kmavillanosa\Pictures\IPHONE"  # <-- change this
-CHECKSUM_DB_PATH = os.path.join(SAVE_DIR, '.checksums.json')
+# Default save directory (fallback if config doesn't exist)
+DEFAULT_SAVE_DIR = r"C:\Users\kmavillanosa\Pictures\IPHONE"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for ultra-fast streaming
 PROGRESS_UPDATE_INTERVAL = 1024 * 1024  # Update progress every 1MB instead of every chunk
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 LOG_FILE = os.path.join(LOG_DIR, 'receiver.log')
+
+# Config file lock for thread-safe access
+config_lock = threading.Lock()
+
+def load_config():
+	"""
+	Load configuration from config.json file.
+	Returns a dictionary with configuration values.
+	"""
+	if os.path.exists(CONFIG_FILE):
+		try:
+			with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+				config = json.load(f)
+				return config
+		except Exception as e:
+			# Use print since logger may not be initialized yet
+			print(f"Warning: Could not load config file: {e}")
+			return {}
+	return {}
+
+def save_config(config):
+	"""
+	Save configuration to config.json file.
+	"""
+	try:
+		with config_lock:
+			# Use atomic write: write to temp file then rename
+			temp_path = CONFIG_FILE + '.tmp'
+			with open(temp_path, 'w', encoding='utf-8') as f:
+				json.dump(config, f, indent=2)
+			os.replace(temp_path, CONFIG_FILE)
+		return True
+	except Exception as e:
+		# Use print since logger may not be initialized yet
+		print(f"Error: Could not save config file: {e}")
+		return False
+
+def get_save_dir():
+	"""
+	Get the save directory from config, or return default.
+	"""
+	config = load_config()
+	save_dir = config.get('save_directory', DEFAULT_SAVE_DIR)
+	# Ensure directory exists
+	os.makedirs(save_dir, exist_ok=True)
+	return save_dir
+
+def set_save_dir(new_dir):
+	"""
+	Set the save directory in config file.
+	Validates that the directory exists or can be created.
+	"""
+	if not new_dir or not new_dir.strip():
+		raise ValueError("Save directory cannot be empty")
+	
+	new_dir = new_dir.strip()
+	
+	# Try to create directory to validate path
+	try:
+		os.makedirs(new_dir, exist_ok=True)
+	except Exception as e:
+		raise ValueError(f"Cannot create directory: {e}")
+	
+	# Update config
+	config = load_config()
+	config['save_directory'] = new_dir
+	if save_config(config):
+		return new_dir
+	else:
+		raise RuntimeError("Failed to save configuration")
+
+# Initialize SAVE_DIR from config
+SAVE_DIR = get_save_dir()
+CHECKSUM_DB_PATH = os.path.join(SAVE_DIR, '.checksums.json')
 
 # Create logs directory if it doesn't exist
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -63,7 +138,7 @@ else:
 		response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
 		return response
 
-os.makedirs(SAVE_DIR, exist_ok=True)
+# SAVE_DIR is already created in get_save_dir()
 
 # Progress tracking: session_id -> {bytes_received, total_bytes, status, file_path}
 upload_progress = {}
@@ -148,6 +223,83 @@ UI_HTML = '''<!DOCTYPE html>
 			flex-wrap: wrap;
 			gap: 10px;
 			border-bottom: 1px solid #ddd;
+		}
+		
+		.settings-section {
+			padding: 15px;
+			background: #f9f9f9;
+			border-bottom: 1px solid #ddd;
+		}
+		
+		.settings-section h3 {
+			font-size: 16px;
+			margin-bottom: 10px;
+			color: #333;
+		}
+		
+		.directory-input-group {
+			display: flex;
+			gap: 10px;
+			align-items: center;
+			flex-wrap: wrap;
+		}
+		
+		.directory-input {
+			flex: 1;
+			min-width: 300px;
+			padding: 8px 12px;
+			border: 1px solid #ccc;
+			font-size: 14px;
+			font-family: monospace;
+		}
+		
+		.directory-display {
+			padding: 8px 12px;
+			background: white;
+			border: 1px solid #ddd;
+			font-size: 13px;
+			font-family: monospace;
+			color: #333;
+			word-break: break-all;
+			margin-top: 5px;
+		}
+		
+		.btn-save {
+			padding: 8px 16px;
+			border: none;
+			background: #28a745;
+			color: white;
+			cursor: pointer;
+			font-size: 14px;
+			border-radius: 4px;
+		}
+		
+		.btn-save:hover {
+			background: #218838;
+		}
+		
+		.btn-save:disabled {
+			background: #6c757d;
+			cursor: not-allowed;
+		}
+		
+		.message {
+			margin-top: 10px;
+			padding: 8px 12px;
+			border-radius: 4px;
+			font-size: 13px;
+		}
+		
+		.message.success {
+			background: #d4edda;
+			border: 1px solid #c3e6cb;
+			color: #155724;
+		}
+		
+		.message.error {
+			background: #f8d7da;
+			border: 1px solid #f5c6cb;
+			color: #721c24;
 		}
 		
 		.btn {
@@ -267,6 +419,16 @@ UI_HTML = '''<!DOCTYPE html>
 				<div class="stat-label">Total Sessions</div>
 				<div class="stat-value" id="total-sessions">0</div>
 			</div>
+		</div>
+		
+		<div class="settings-section">
+			<h3>📁 Save Directory Settings</h3>
+			<div class="directory-input-group">
+				<input type="text" id="save-directory-input" class="directory-input" placeholder="Enter directory path (e.g., C:\\Users\\YourName\\Pictures\\IPHONE)" />
+				<button class="btn-save" onclick="updateSaveDirectory()">Save Directory</button>
+			</div>
+			<div class="directory-display" id="current-directory">Loading...</div>
+			<div id="directory-message"></div>
 		</div>
 		
 		<div class="controls">
@@ -499,8 +661,80 @@ UI_HTML = '''<!DOCTYPE html>
 			fetchLogs();
 		}
 		
+		async function fetchSaveDirectory() {
+			try {
+				const response = await fetch('/api/save-directory');
+				const data = await response.json();
+				
+				if (data.success) {
+					document.getElementById('current-directory').textContent = 'Current: ' + data.save_directory;
+					document.getElementById('save-directory-input').value = data.save_directory;
+				} else {
+					document.getElementById('current-directory').textContent = 'Error loading directory';
+				}
+			} catch (error) {
+				console.error('Error fetching save directory:', error);
+				document.getElementById('current-directory').textContent = 'Error loading directory';
+			}
+		}
+		
+		async function updateSaveDirectory() {
+			const input = document.getElementById('save-directory-input');
+			const newDir = input.value.trim();
+			const messageDiv = document.getElementById('directory-message');
+			const saveBtn = document.querySelector('.btn-save');
+			
+			if (!newDir) {
+				messageDiv.innerHTML = '<div class="message error">Please enter a directory path</div>';
+				return;
+			}
+			
+			saveBtn.disabled = true;
+			saveBtn.textContent = 'Saving...';
+			messageDiv.innerHTML = '';
+			
+			try {
+				const response = await fetch('/api/save-directory', {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json'
+					},
+					body: JSON.stringify({ save_directory: newDir })
+				});
+				
+				const data = await response.json();
+				
+				if (data.success) {
+					messageDiv.innerHTML = '<div class="message success">Directory updated successfully! The server will use this directory for new uploads.</div>';
+					document.getElementById('current-directory').textContent = 'Current: ' + data.save_directory;
+					// Refresh stats to show updated directory info
+					fetchStats();
+				} else {
+					messageDiv.innerHTML = '<div class="message error">Error: ' + (data.error || 'Failed to update directory') + '</div>';
+				}
+			} catch (error) {
+				messageDiv.innerHTML = '<div class="message error">Error: ' + error.message + '</div>';
+			} finally {
+				saveBtn.disabled = false;
+				saveBtn.textContent = 'Save Directory';
+			}
+		}
+		
+		// Allow Enter key to save directory
+		document.addEventListener('DOMContentLoaded', function() {
+			const input = document.getElementById('save-directory-input');
+			if (input) {
+				input.addEventListener('keypress', function(e) {
+					if (e.key === 'Enter') {
+						updateSaveDirectory();
+					}
+				});
+			}
+		});
+		
 		// Initialize
 		refreshLogs();
+		fetchSaveDirectory();
 		startAutoRefresh();
 		
 		// Refresh stats every 5 seconds
@@ -653,7 +887,9 @@ def get_year_folder_path(year):
 	"""
 	Get the path for a year folder, creating it if necessary.
 	"""
-	year_path = os.path.join(SAVE_DIR, str(year))
+	# Always get current save directory (in case it changed)
+	current_save_dir = get_save_dir()
+	year_path = os.path.join(current_save_dir, str(year))
 	os.makedirs(year_path, exist_ok=True)
 	return year_path
 
@@ -1220,6 +1456,66 @@ def get_total_files_size(directory):
 		logger.warning(f"Error calculating total file size: {e}")
 		return 0
 
+@app.route("/api/save-directory", methods=["GET"])
+def get_save_directory():
+	"""
+	Get the current save directory setting.
+	"""
+	try:
+		current_dir = get_save_dir()
+		return jsonify({
+			'success': True,
+			'save_directory': current_dir
+		}), 200
+	except Exception as e:
+		logger.error(f"Error getting save directory: {e}", exc_info=True)
+		return jsonify({
+			'success': False,
+			'error': str(e)
+		}), 500
+
+@app.route("/api/save-directory", methods=["POST"])
+def update_save_directory():
+	"""
+	Update the save directory setting.
+	"""
+	try:
+		data = request.get_json()
+		if not data or 'save_directory' not in data:
+			return jsonify({
+				'success': False,
+				'error': 'save_directory field is required'
+			}), 400
+		
+		new_dir = data['save_directory']
+		
+		# Update the save directory
+		updated_dir = set_save_dir(new_dir)
+		
+		# Update global SAVE_DIR and CHECKSUM_DB_PATH
+		global SAVE_DIR, CHECKSUM_DB_PATH
+		SAVE_DIR = updated_dir
+		CHECKSUM_DB_PATH = os.path.join(SAVE_DIR, '.checksums.json')
+		
+		logger.info(f"Save directory updated to: {updated_dir}")
+		
+		return jsonify({
+			'success': True,
+			'save_directory': updated_dir,
+			'message': 'Save directory updated successfully'
+		}), 200
+	except ValueError as e:
+		return jsonify({
+			'success': False,
+			'error': str(e)
+		}), 400
+	except Exception as e:
+		logger.error(f"Error updating save directory: {e}", exc_info=True)
+		return jsonify({
+			'success': False,
+			'error': str(e)
+		}), 500
+
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
 	"""
@@ -1235,11 +1531,14 @@ def get_stats():
 		if os.path.exists(LOG_FILE):
 			log_size = os.path.getsize(LOG_FILE)
 		
+		# Get current save directory (may have changed)
+		current_save_dir = get_save_dir()
+		
 		# Count files in save directory
-		file_count = count_files_in_directory(SAVE_DIR)
+		file_count = count_files_in_directory(current_save_dir)
 		
 		# Calculate total size of all uploaded files
-		total_files_size = get_total_files_size(SAVE_DIR)
+		total_files_size = get_total_files_size(current_save_dir)
 		
 		return jsonify({
 			'success': True,
@@ -1248,7 +1547,7 @@ def get_stats():
 			'log_file_size': log_size,
 			'file_count': file_count,
 			'total_files_size': total_files_size,
-			'save_directory': SAVE_DIR
+			'save_directory': current_save_dir
 		}), 200
 	except Exception as e:
 		logger.error(f"Error getting stats: {e}", exc_info=True)
